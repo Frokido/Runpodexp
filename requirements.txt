@@ -1,0 +1,14 @@
+torch>=2.1.0
+diffusers>=0.26.3
+transformers>=4.39.0
+huggingface_hub>=0.20.0
+gradio>=4.13.0
+accelerate>=0.29.2
+pillow>=10.2.0
+opencv-python>=4.10.0.0
+numpy>=1.26.0
+tqdm>=4.66.1
+diffsynth>=0.0.15
+torchaudio>=2.1.0
+sentencepiece>=0.2.0
+scipy>=1.11.0
