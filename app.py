@@ -1,712 +1,719 @@
-"""Main entry point for the experimental generative-AI kit.
-
-This script defines a modular Gradio interface that wraps several open-source
-diffusion pipelines. It exposes text-to-video, image-to-video, text-to-image
-and audio generation capabilities while offering advanced settings such as
-TeaCache acceleration and CFG-Zero* guidance. The goal is to provide a
-single interface with a full range of features that runs efficiently on a
-RunPod L40S GPU (48 GB VRAM).
-
-Notes:
-  * Actual model downloads can take a long time and may require large
-    amounts of disk space. Ensure your pod has sufficient storage.
-  * This script does **not** enable any safety checker â€” NSFW content will
-    pass through untouched. Use responsibly.
-
-Author: ChatGPT (generated)
+#!/usr/bin/env python3
+"""
+RunPod AI Kit - Fixed Production Version
+Addresses: AsyncIO issues, thread safety, resource management, error handling
+Maintains: NSFW capabilities for testing/experimentation
 """
 
-import asyncio
 import os
+import sys
+import json
+import time
+import logging
 import threading
+import traceback
+from typing import Dict, Any, Optional, List, Tuple, Union
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Dict, List, Optional, Tuple
+from contextlib import contextmanager
+import gc
 
-import gradio as gr
-import numpy as np
 import torch
-
-try:
-    # Diffusers is used for general diffusion pipelines
-    from diffusers import DiffusionPipeline
-except ImportError:
-    DiffusionPipeline = None  # type: ignore
-
-try:
-    # DiffSynth provides memory-efficient pipelines for Wan and other models
-    from diffsynth.pipelines.wan_video_new import (
-        WanVideoPipeline,
-        ModelConfig as WanModelConfig,
-    )
-    from diffsynth.pipelines.flux_image_new import (
-        FluxImagePipeline,
-        ModelConfig as FluxModelConfig,
-    )
-    from diffsynth.pipelines.qwen_image import (
-        QwenImagePipeline,
-        ModelConfig as QwenModelConfig,
-    )
-except Exception:
-    WanVideoPipeline = None  # type: ignore
-    FluxImagePipeline = None  # type: ignore
-    QwenImagePipeline = None  # type: ignore
-    WanModelConfig = None  # type: ignore
-    FluxModelConfig = None  # type: ignore
-    QwenModelConfig = None  # type: ignore
-
-# Attempt to import optional acceleration libraries
-try:
-    import teacache  # type: ignore
-except ImportError:
-    teacache = None  # type: ignore
-
-try:
-    # Assume a hypothetical cfg_zero_star module; if unavailable we'll
-    # implement a simple wrapper later.
-    import cfg_zero_star  # type: ignore
-except ImportError:
-    cfg_zero_star = None  # type: ignore
-
-
-# ----------------------------- Helper functions -----------------------------
-
-def apply_teacache(pipe: Any) -> Any:
-    """If TeaCache is available, wrap the pipeline with caching.
-
-    TeaCache accelerates diffusion inference by caching intermediate states
-    across timesteps. This function attempts to
-    enable caching on the provided pipeline. If TeaCache is not installed,
-    the pipeline is returned unchanged.
-    """
-    if teacache is None:
-        print("TeaCache is not installed; returning pipeline unchanged.")
-        return pipe
-    try:
-        # Many TeaCache integrations rely on a simple `.use_cache()` method.
-        # If the pipeline exposes it, call it. Otherwise, fallback to
-        # teacache.apply() which may wrap the pipeline internally.
-        if hasattr(pipe, "use_cache"):
-            pipe.use_cache()
-        else:
-            pipe = teacache.apply(pipe)
-        print("TeaCache acceleration enabled.")
-    except Exception as e:
-        print(f"Failed to enable TeaCache: {e}")
-    return pipe
-
-
-class CFGZeroStarWrapper:
-    """A lightweight wrapper to emulate CFG-Zero* behaviour.
-
-    CFG-Zero* improves classifier-free guidance by zeroing out a percentage
-    of early solver steps and scaling the guidance. The
-    official implementation supports many models but may not be installed.
-    This wrapper provides a simple `apply` method that adjusts the
-    scheduler's guidance scale and stores the zero-init ratio. It does not
-    modify the underlying solver but lets users experiment with the
-    parameters. For more faithful behaviour, install the official library.
-    """
-
-    def __init__(self, pipe: Any, guidance_scale: float = 1.0, zero_ratio: float = 0.04) -> None:
-        self.pipe = pipe
-        self.guidance_scale = guidance_scale
-        self.zero_ratio = zero_ratio
-        # Store original guidance scale if available
-        self._original_scale = getattr(pipe, "guidance_scale", None)
-        # Immediately apply guidance scale
-        if hasattr(self.pipe, "guidance_scale"):
-            self.pipe.guidance_scale = guidance_scale
-
-    def __getattr__(self, item: str) -> Any:
-        return getattr(self.pipe, item)
-
-    def __call__(self, *args: Any, **kwargs: Any) -> Any:
-        # Forward call to underlying pipeline
-        return self.pipe(*args, **kwargs)
-
-
-def apply_cfg_zero(pipe: Any, guidance_scale: float, zero_ratio: float) -> Any:
-    """Apply CFG-Zero* guidance to the pipeline.
-
-    If the official cfg_zero_star module is available, it will be used.
-    Otherwise a simple wrapper that sets the guidance scale and stores the
-    zero ratio is returned.
-    """
-    if cfg_zero_star is not None:
-        try:
-            return cfg_zero_star.apply(pipe, guidance_scale=guidance_scale, zero_ratio=zero_ratio)
-        except Exception as e:
-            print(f"cfg_zero_star apply failed: {e}; falling back to wrapper.")
-    # fallback
-    return CFGZeroStarWrapper(pipe, guidance_scale, zero_ratio)
-
-
-def disable_safety(pipe: Any) -> None:
-    """Disable any built-in safety checker on the pipeline.
-
-    Many Diffusers pipelines expose `safety_checker` or similar attributes
-    which can be set to `None` to bypass nudity/NSFW filters. This helper
-    attempts to locate and disable them.
-    """
-    for attr in ["safety_checker", "nsfw_checker", "safety_check"]:
-        if hasattr(pipe, attr):
-            try:
-                setattr(pipe, attr, None)
-                print(f"Disabled {attr} on pipeline.")
-            except Exception:
-                pass
-
-
-def load_wan_pipeline(
-    task: str,
-    model_size: str,
-    dtype: torch.dtype,
-    offload: bool,
-    use_cache: bool,
-    use_cfg_zero: bool,
-    guidance_scale: float,
-    zero_ratio: float,
-) -> Any:
-    """Load a Wan 2.2 or Wan 2.1 diffusion pipeline via DiffSynth.
-
-    Args:
-        task: 't2v', 'i2v' or 'ti2v'.
-        model_size: 'A14B' for 14 B models or '5B' for 5 B models.
-        dtype: torch dtype (e.g. torch.float16 or torch.bfloat16).
-        offload: whether to enable CPU offloading.
-        use_cache: whether to enable TeaCache.
-        use_cfg_zero: whether to apply CFG-Zero*.
-        guidance_scale: scale for classifier-free guidance.
-        zero_ratio: percentage of steps to zero out (0-1).
-    Returns:
-        A loaded pipeline ready for inference.
-    """
-    if WanVideoPipeline is None:
-        raise RuntimeError(
-            "DiffSynth is not installed; unable to load Wan models.\n"
-            "Please install diffsynth (see requirements.txt) and try again."
-        )
-
-    # Map tasks to official model ids. Users can modify these identifiers to
-    # load custom checkpoints. 14B models require significant VRAM; the 5B
-    # model is more memory-friendly.
-    if task == "t2v":
-        model_id = "Wan-AI/Wan2.2-T2V-A14B" if model_size.upper() == "A14B" else "Wan-AI/Wan2.2-T2V-5B"
-    elif task == "i2v":
-        model_id = "Wan-AI/Wan2.2-I2V-A14B" if model_size.upper() == "A14B" else "Wan-AI/Wan2.2-I2V-5B"
-    else:
-        # text-image-to-video
-        model_id = "Wan-AI/Wan2.2-TI2V-A14B" if model_size.upper() == "A14B" else "Wan-AI/Wan2.2-TI2V-5B"
-
-    # Construct a DiffSynth ModelConfig list. Wan models use multiple
-    # sub-components (transformer, VAE, etc.) but DiffSynth hides this
-    # complexity behind `model_configs`.
-    model_configs = [
-        WanModelConfig(model_id=model_id, origin_file_pattern="**/*.safetensors"),
-    ]
-
-    # Load the pipeline
-    pipe = WanVideoPipeline.from_pretrained(
-        model_configs=model_configs,
-        torch_dtype=dtype,
-        device="cuda" if torch.cuda.is_available() else "cpu",
-    )
-
-    disable_safety(pipe)
-
-    # Offload to CPU if requested. DiffSynth exposes offload options via
-    # `offload_model` or `offload_text_encoder` on individual calls. Here we
-    # just set a flag that our generation function will respect.
-    pipe._offload = offload
-
-    # Apply TeaCache if enabled
-    if use_cache:
-        pipe = apply_teacache(pipe)
-
-    # Apply CFG-Zero* if enabled
-    if use_cfg_zero:
-        pipe = apply_cfg_zero(pipe, guidance_scale, zero_ratio)
-
-    return pipe
-
-
-def load_flux_pipeline(
-    dtype: torch.dtype,
-    offload: bool,
-    use_cache: bool,
-    use_cfg_zero: bool,
-    guidance_scale: float,
-    zero_ratio: float,
-) -> Any:
-    """Load a FLUX image pipeline via DiffSynth.
-
-    FLUX is a family of image diffusion models supported by DiffSynth.
-    This function constructs the pipeline and applies optional TeaCache and
-    CFG-Zero* modifications.
-    """
-    if FluxImagePipeline is None:
-        raise RuntimeError(
-            "DiffSynth is not installed; unable to load FLUX models."
-        )
-    model_configs = [
-        FluxModelConfig(model_id="black-forest-labs/FLUX.1-dev", origin_file_pattern="*.safetensors"),
-    ]
-    pipe = FluxImagePipeline.from_pretrained(
-        model_configs=model_configs,
-        torch_dtype=dtype,
-        device="cuda" if torch.cuda.is_available() else "cpu",
-    )
-    disable_safety(pipe)
-    pipe._offload = offload
-    if use_cache:
-        pipe = apply_teacache(pipe)
-    if use_cfg_zero:
-        pipe = apply_cfg_zero(pipe, guidance_scale, zero_ratio)
-    return pipe
-
-
-def load_qwen_pipeline(
-    dtype: torch.dtype,
-    offload: bool,
-    use_cache: bool,
-    use_cfg_zero: bool,
-    guidance_scale: float,
-    zero_ratio: float,
-) -> Any:
-    """Load a Qwen-Image pipeline via DiffSynth.
-
-    Qwen-Image is a recent image generator that can embed full sentences and
-    supports LoRA training.
-    """
-    if QwenImagePipeline is None:
-        raise RuntimeError("DiffSynth is not installed; unable to load Qwen models.")
-    model_configs = [
-        QwenModelConfig(model_id="Qwen/Qwen-Image", origin_file_pattern="**/*.safetensors"),
-    ]
-    pipe = QwenImagePipeline.from_pretrained(
-        model_configs=model_configs,
-        torch_dtype=dtype,
-        device="cuda" if torch.cuda.is_available() else "cpu",
-    )
-    disable_safety(pipe)
-    pipe._offload = offload
-    if use_cache:
-        pipe = apply_teacache(pipe)
-    if use_cfg_zero:
-        pipe = apply_cfg_zero(pipe, guidance_scale, zero_ratio)
-    return pipe
-
-
-# Global cache to reuse loaded pipelines across requests
-PIPELINE_CACHE: Dict[str, Any] = {}
-
-
-async def generate_video(
-    prompt: str,
-    task: str,
-    model_size: str,
-    resolution: Tuple[int, int],
-    num_frames: int,
-    guidance_scale: float,
-    dtype_str: str,
-    offload: bool,
-    use_cache: bool,
-    use_cfg_zero: bool,
-    zero_ratio: float,
-    seed: Optional[int] = None,
-) -> Tuple[str, Optional[str]]:
-    """Asynchronous task that generates a video given user options.
-
-    Returns a tuple of (video_path, info_message). If generation fails,
-    `video_path` may be None and an error message will be provided.
-    """
-    dtype = torch.float16 if dtype_str == "float16" else torch.bfloat16
-    key = f"wan_{task}_{model_size}_{dtype_str}_{offload}_{use_cache}_{use_cfg_zero}_{guidance_scale}_{zero_ratio}"
-    if key not in PIPELINE_CACHE:
-        PIPELINE_CACHE[key] = load_wan_pipeline(
-            task=task,
-            model_size=model_size,
-            dtype=dtype,
-            offload=offload,
-            use_cache=use_cache,
-            use_cfg_zero=use_cfg_zero,
-            guidance_scale=guidance_scale,
-            zero_ratio=zero_ratio,
-        )
-    pipe = PIPELINE_CACHE[key]
-    # Set seed if provided
-    generator = torch.Generator(device=pipe.device)
-    if seed is not None:
-        generator = generator.manual_seed(seed)
-    # Prepare parameters. Many pipelines accept `num_inference_steps` and
-    # `video_length` or `num_frames` parameters. Use 50 inference steps by
-    # default and allow TeaCache/CFG-Zero to accelerate effectively.
-    kwargs: Dict[str, Any] = {
-        "prompt": prompt,
-        "num_inference_steps": 50,
-        "num_frames": num_frames,
-        "generator": generator,
-        "height": resolution[1],
-        "width": resolution[0],
-        "guidance_scale": guidance_scale,
-        "offload_model": getattr(pipe, "_offload", False),
-    }
-    try:
-        result = pipe(**kwargs)
-        # The result from DiffSynth pipelines may be a dictionary containing
-        # a video tensor or list of frames. Convert to an MP4 file.
-        video_path = os.path.join("outputs", f"wan_video_{task}_{model_size}_{os.getpid()}.mp4")
-        os.makedirs(os.path.dirname(video_path), exist_ok=True)
-        # Attempt to use the built-in save function if available
-        if hasattr(result, "save"):
-            result.save(video_path)
-        else:
-            # Fallback: assume result["video"] is a numpy array of shape
-            # (frames, height, width, 3)
-            frames = None
-            if isinstance(result, dict):
-                frames = result.get("video") or result.get("frames")
-            elif hasattr(result, "frames"):
-                frames = result.frames
-            if frames is None:
-                raise ValueError("Unsupported result type from pipeline")
-            import imageio.v3 as iio  # local import to avoid unnecessary dependency
-            iio.imwrite(
-                video_path,
-                (np.array(frames) * 255).astype(np.uint8),
-                fps=24,
-                format="mp4",
-            )
-        return video_path, None
-    except Exception as e:
-        return "", str(e)
-
-
-async def generate_image(
-    prompt: str,
-    model_type: str,
-    guidance_scale: float,
-    dtype_str: str,
-    offload: bool,
-    use_cache: bool,
-    use_cfg_zero: bool,
-    zero_ratio: float,
-    seed: Optional[int] = None,
-) -> Tuple[str, Optional[str]]:
-    """Asynchronous task that generates an image from a text prompt.
-
-    The `model_type` argument selects among 'flux' and 'qwen'.
-    """
-    dtype = torch.float16 if dtype_str == "float16" else torch.bfloat16
-    if model_type == "flux":
-        key = f"flux_{dtype_str}_{offload}_{use_cache}_{use_cfg_zero}_{guidance_scale}_{zero_ratio}"
-        if key not in PIPELINE_CACHE:
-            PIPELINE_CACHE[key] = load_flux_pipeline(
-                dtype=dtype,
-                offload=offload,
-                use_cache=use_cache,
-                use_cfg_zero=use_cfg_zero,
-                guidance_scale=guidance_scale,
-                zero_ratio=zero_ratio,
-            )
-        pipe = PIPELINE_CACHE[key]
-    else:  # qwen
-        key = f"qwen_{dtype_str}_{offload}_{use_cache}_{use_cfg_zero}_{guidance_scale}_{zero_ratio}"
-        if key not in PIPELINE_CACHE:
-            PIPELINE_CACHE[key] = load_qwen_pipeline(
-                dtype=dtype,
-                offload=offload,
-                use_cache=use_cache,
-                use_cfg_zero=use_cfg_zero,
-                guidance_scale=guidance_scale,
-                zero_ratio=zero_ratio,
-            )
-        pipe = PIPELINE_CACHE[key]
-    generator = torch.Generator(device=pipe.device)
-    if seed is not None:
-        generator = generator.manual_seed(seed)
-    kwargs = {
-        "prompt": prompt,
-        "num_inference_steps": 40,
-        "generator": generator,
-        "guidance_scale": guidance_scale,
-        "offload_model": getattr(pipe, "_offload", False),
-    }
-    try:
-        result = pipe(**kwargs)
-        image_path = os.path.join("outputs", f"image_{model_type}_{os.getpid()}.png")
-        os.makedirs(os.path.dirname(image_path), exist_ok=True)
-        if hasattr(result, "save"):
-            result.save(image_path)
-        else:
-            from PIL import Image
-            img = None
-            if isinstance(result, dict):
-                img = result.get("images") or result.get("image")
-            elif hasattr(result, "images"):
-                img = result.images
-            if img is None:
-                raise ValueError("Unsupported result type from pipeline")
-            # img may be a list of PIL images or numpy arrays
-            if isinstance(img, list):
-                img = img[0]
-            if isinstance(img, np.ndarray):
-                img = Image.fromarray((img * 255).astype(np.uint8))
-            img.save(image_path)
-        return image_path, None
-    except Exception as e:
-        return "", str(e)
-
-
-# A simple task queue. Tasks are appended when submitted and processed
-# sequentially in a background worker. Each task is a coroutine returning
-# (file_path, error_message).
-TASK_QUEUE: List[asyncio.Future] = []
-TASK_QUEUE_LOCK = threading.Lock()
-
-
-def enqueue_task(coro) -> asyncio.Future:
-    """Schedule a coroutine to run in the background and add it to the queue.
-
-    Returns a Future that will hold the result. The internal worker will
-    process tasks one at a time.
-    """
-    loop = asyncio.get_event_loop()
-    future = loop.create_task(coro)
-    with TASK_QUEUE_LOCK:
-        TASK_QUEUE.append(future)
-    return future
-
-
-async def task_worker() -> None:
-    """Continuously process tasks from the queue."""
-    while True:
-        await asyncio.sleep(0.1)
-        next_task: Optional[asyncio.Future] = None
-        with TASK_QUEUE_LOCK:
-            if TASK_QUEUE and TASK_QUEUE[0].done():
-                TASK_QUEUE.pop(0)
-            if TASK_QUEUE:
-                next_task = TASK_QUEUE[0]
-        if next_task is not None and not next_task.done():
-            # Wait for the current task to complete before starting the next
-            await asyncio.sleep(0.1)
-
-
-# Launch the worker in the background
-asyncio.get_event_loop().create_task(task_worker())
-
-
-# ------------------------------ UI Definition ------------------------------
-
-def build_interface() -> gr.Blocks:
-    """Construct the Gradio Blocks interface."""
-    with gr.Blocks(css=".gradio-container {max-width: 1024px; margin: auto;}\n") as demo:
-        gr.Markdown(
-            "# Experimental Generative-AI Kit\n"
-            "This interface provides advanced generation tools built on Wan 2.2, Flux, Qwen and other cutting-edge models.\n"
-            "All safety filters are disabled. Use at your own risk."
-        )
-        with gr.Tabs():
-            # Text to Video Tab
-            with gr.TabItem("Text to Video"):
-                with gr.Row():
-                    prompt_t2v = gr.Textbox(label="Prompt", lines=3, placeholder="Describe your scene...")
-                with gr.Row():
-                    model_size_t2v = gr.Dropdown(["A14B", "5B"], label="Model Size", value="5B", info="5B uses less VRAM; 14B offers higher quality")
-                    task_t2v = gr.Dropdown([("Text to Video", "t2v"), ("Image to Video", "i2v"), ("Text+Image to Video", "ti2v")], label="Task", value="t2v")
-                    resolution_t2v = gr.Dropdown([("720p (1280x720)", (1280, 720)), ("480p (960x540)", (960, 540))], label="Resolution", value=(960, 540))
-                    num_frames_t2v = gr.Slider(16, 64, value=24, step=8, label="Number of Frames")
-                with gr.Row():
-                    seed_t2v = gr.Number(label="Seed (optional)", value=None, precision=0)
-                generate_button_t2v = gr.Button("Generate Video")
-                output_video = gr.Video(label="Generated Video", interactive=False)
-                error_video = gr.Textbox(label="Error Message", interactive=False, visible=False)
-
-                def on_generate_video(
-                    prompt: str,
-                    task: str,
-                    model_size: str,
-                    resolution: Tuple[int, int],
-                    num_frames: int,
-                    seed: Optional[float],
-                ) -> Tuple[str, str]:
-                    """Callback for video generation. Schedules the task and waits for completion."""
-                    # Convert seed to int if provided
-                    seed_int: Optional[int] = None
-                    if seed is not None and seed != "":
-                        try:
-                            seed_int = int(seed)
-                        except Exception:
-                            pass
-                    future = enqueue_task(
-                        generate_video(
-                            prompt=prompt,
-                            task=task,
-                            model_size=model_size,
-                            resolution=resolution,
-                            num_frames=int(num_frames),
-                            guidance_scale=settings_state["guidance_scale"],
-                            dtype_str=settings_state["dtype"],
-                            offload=settings_state["offload"],
-                            use_cache=settings_state["use_cache"],
-                            use_cfg_zero=settings_state["use_cfg_zero"],
-                            zero_ratio=settings_state["zero_ratio"],
-                            seed=seed_int,
-                        )
-                    )
-                    # Wait for the task to finish
-                    video_path, err = asyncio.get_event_loop().run_until_complete(future)
-                    if err:
-                        return "", err
-                    return video_path, ""
-
-                generate_button_t2v.click(
-                    on_generate_video,
-                    inputs=[prompt_t2v, task_t2v, model_size_t2v, resolution_t2v, num_frames_t2v, seed_t2v],
-                    outputs=[output_video, error_video],
-                )
-
-            # Text to Image Tab
-            with gr.TabItem("Text to Image"):
-                with gr.Row():
-                    prompt_img = gr.Textbox(label="Prompt", lines=3, placeholder="A detailed portrait of a girl underwater...")
-                with gr.Row():
-                    image_model = gr.Dropdown([("FLUX", "flux"), ("Qwen-Image", "qwen")], label="Model", value="flux")
-                    seed_img = gr.Number(label="Seed (optional)", value=None, precision=0)
-                generate_button_img = gr.Button("Generate Image")
-                output_image = gr.Image(label="Generated Image", interactive=False)
-                error_image = gr.Textbox(label="Error Message", interactive=False, visible=False)
-
-                def on_generate_image(prompt: str, model: str, seed: Optional[float]) -> Tuple[str, str]:
-                    seed_int: Optional[int] = None
-                    if seed is not None and seed != "":
-                        try:
-                            seed_int = int(seed)
-                        except Exception:
-                            pass
-                    future = enqueue_task(
-                        generate_image(
-                            prompt=prompt,
-                            model_type=model,
-                            guidance_scale=settings_state["guidance_scale"],
-                            dtype_str=settings_state["dtype"],
-                            offload=settings_state["offload"],
-                            use_cache=settings_state["use_cache"],
-                            use_cfg_zero=settings_state["use_cfg_zero"],
-                            zero_ratio=settings_state["zero_ratio"],
-                            seed=seed_int,
-                        )
-                    )
-                    img_path, err = asyncio.get_event_loop().run_until_complete(future)
-                    if err:
-                        return "", err
-                    return img_path, ""
-
-                generate_button_img.click(
-                    on_generate_image,
-                    inputs=[prompt_img, image_model, seed_img],
-                    outputs=[output_image, error_image],
-                )
-
-            # Settings Tab
-            with gr.TabItem("Settings"):
-                with gr.Row():
-                    guidance_scale_slider = gr.Slider(0.0, 20.0, value=1.0, step=0.1, label="Guidance Scale (CFG)")
-                    dtype_dropdown = gr.Dropdown([("FP16", "float16"), ("BF16", "bfloat16")], label="Tensor dtype", value="float16")
-                with gr.Row():
-                    offload_checkbox = gr.Checkbox(label="CPU Offload", value=False)
-                    cache_checkbox = gr.Checkbox(label="Enable TeaCache", value=False)
-                    cfgzero_checkbox = gr.Checkbox(label="Enable CFG-Zero*", value=False)
-                zero_ratio_slider = gr.Slider(0.0, 0.2, value=0.04, step=0.01, label="Zero-Init Ratio (CFG-Zero*)")
-                # Display of current settings
-                settings_display = gr.Markdown()
-
-                def update_settings(
-                    guidance_scale: float,
-                    dtype: str,
-                    offload: bool,
-                    use_cache: bool,
-                    use_cfg_zero: bool,
-                    zero_ratio: float,
-                ) -> str:
-                    # Update global state
-                    settings_state["guidance_scale"] = guidance_scale
-                    settings_state["dtype"] = dtype
-                    settings_state["offload"] = offload
-                    settings_state["use_cache"] = use_cache
-                    settings_state["use_cfg_zero"] = use_cfg_zero
-                    settings_state["zero_ratio"] = zero_ratio
-                    return (
-                        f"**Current Settings**:\n"
-                        f"* Guidance scale: {guidance_scale}\n"
-                        f"* dtype: {dtype}\n"
-                        f"* CPU offload: {offload}\n"
-                        f"* TeaCache: {use_cache}\n"
-                        f"* CFG-Zero*: {use_cfg_zero} (zero ratio: {zero_ratio*100:.1f}% of steps)\n"
-                    )
-
-                # Register change events individually. When any setting is
-                # modified, the markdown display is updated to reflect the
-                # current configuration. Using separate callbacks avoids
-                # reliance on `gr.update` which is not available outside
-                # internal usage.
-                def on_change(
-                    guidance_scale: float,
-                    dtype: str,
-                    offload: bool,
-                    use_cache: bool,
-                    use_cfg_zero: bool,
-                    zero_ratio: float,
-                ) -> str:
-                    return update_settings(
-                        guidance_scale,
-                        dtype,
-                        offload,
-                        use_cache,
-                        use_cfg_zero,
-                        zero_ratio,
-                    )
-
-                # Connect each input's `change` event to update the settings
-                for component in [
-                    guidance_scale_slider,
-                    dtype_dropdown,
-                    offload_checkbox,
-                    cache_checkbox,
-                    cfgzero_checkbox,
-                    zero_ratio_slider,
-                ]:
-                    component.change(
-                        on_change,
-                        inputs=[
-                            guidance_scale_slider,
-                            dtype_dropdown,
-                            offload_checkbox,
-                            cache_checkbox,
-                            cfgzero_checkbox,
-                            zero_ratio_slider,
-                        ],
-                        outputs=settings_display,
-                    )
-
-        return demo
-
-
-# State dictionary updated via the Settings tab. Defaults reflect typical
-# settings for the L40S (FP16, no offload).
-settings_state = {
-    "guidance_scale": 1.0,
-    "dtype": "float16",
-    "offload": False,
-    "use_cache": False,
-    "use_cfg_zero": False,
-    "zero_ratio": 0.04,
+import gradio as gr
+from PIL import Image
+import numpy as np
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# Global configuration
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+MAX_CACHE_SIZE = 3  # Maximum number of cached pipelines
+TASK_TIMEOUT = 300  # 5 minutes timeout for tasks
+
+# Thread-safe pipeline cache with proper cleanup
+class PipelineCache:
+    def __init__(self, max_size: int = MAX_CACHE_SIZE):
+        self._cache: Dict[str, Any] = {}
+        self._access_times: Dict[str, float] = {}
+        self._lock = threading.RLock()
+        self._max_size = max_size
+        
+    def get(self, key: str) -> Optional[Any]:
+        with self._lock:
+            if key in self._cache:
+                self._access_times[key] = time.time()
+                return self._cache[key]
+            return None
+    
+    def set(self, key: str, value: Any) -> None:
+        with self._lock:
+            # Clean up CUDA memory from evicted pipeline
+            if len(self._cache) >= self._max_size:
+                self._evict_lru()
+            
+            self._cache[key] = value
+            self._access_times[key] = time.time()
+    
+    def _evict_lru(self) -> None:
+        """Evict least recently used pipeline with proper cleanup"""
+        if not self._cache:
+            return
+            
+        oldest_key = min(self._access_times.keys(), key=lambda k: self._access_times[k])
+        pipeline = self._cache.pop(oldest_key)
+        self._access_times.pop(oldest_key)
+        
+        # Cleanup CUDA memory
+        if hasattr(pipeline, 'to'):
+            pipeline.to('cpu')
+        del pipeline
+        torch.cuda.empty_cache()
+        gc.collect()
+        logger.info(f"Evicted pipeline: {oldest_key}")
+    
+    def clear(self) -> None:
+        with self._lock:
+            for pipeline in self._cache.values():
+                if hasattr(pipeline, 'to'):
+                    pipeline.to('cpu')
+            self._cache.clear()
+            self._access_times.clear()
+            torch.cuda.empty_cache()
+            gc.collect()
+
+# Global instances
+PIPELINE_CACHE = PipelineCache()
+TASK_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="AI-Task")
+
+# Resolution configurations with proper validation
+RESOLUTION_PRESETS = {
+    "Square (1024x1024)": (1024, 1024),
+    "Portrait (768x1024)": (768, 1024),
+    "Landscape (1024x768)": (1024, 768),
+    "Widescreen (1280x720)": (1280, 720),
+    "Ultra-wide (1536x640)": (1536, 640)
 }
 
+VIDEO_RESOLUTION_PRESETS = {
+    "480p (854x480)": (854, 480),
+    "720p (1280x720)": (1280, 720),
+    "1080p (1920x1080)": (1920, 1080)
+}
+
+@contextmanager
+def cuda_memory_cleanup():
+    """Context manager for CUDA memory cleanup"""
+    try:
+        yield
+    finally:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+
+def validate_resolution(width: int, height: int, max_pixels: int = 2073600) -> Tuple[int, int]:
+    """Validate and adjust resolution to prevent memory issues"""
+    # Ensure dimensions are multiples of 8 for stable diffusion
+    width = max(64, (width // 8) * 8)
+    height = max(64, (height // 8) * 8)
+    
+    # Check total pixel count
+    total_pixels = width * height
+    if total_pixels > max_pixels:
+        scale = (max_pixels / total_pixels) ** 0.5
+        width = int((width * scale) // 8) * 8
+        height = int((height * scale) // 8) * 8
+        logger.warning(f"Resolution scaled down to {width}x{height} to prevent memory issues")
+    
+    return width, height
+
+def load_pipeline_safe(pipeline_type: str, model_name: str, **kwargs) -> Any:
+    """Thread-safe pipeline loading with proper error handling"""
+    cache_key = f"{pipeline_type}_{model_name}"
+    
+    # Check cache first
+    pipeline = PIPELINE_CACHE.get(cache_key)
+    if pipeline is not None:
+        logger.info(f"Using cached pipeline: {cache_key}")
+        return pipeline
+    
+    logger.info(f"Loading new pipeline: {cache_key}")
+    
+    try:
+        with cuda_memory_cleanup():
+            if pipeline_type == "flux":
+                from diffusers import FluxPipeline
+                pipeline = FluxPipeline.from_pretrained(
+                    model_name,
+                    torch_dtype=torch.bfloat16,
+                    device_map="balanced",
+                    max_memory={0: "20GB", "cpu": "30GB"}
+                )
+                # Keep safety checker disabled for testing
+                if hasattr(pipeline, 'safety_checker'):
+                    pipeline.safety_checker = None
+                
+            elif pipeline_type == "wuerstchen":
+                from diffusers import WuerstchenCombinedPipeline
+                pipeline = WuerstchenCombinedPipeline.from_pretrained(
+                    model_name,
+                    torch_dtype=torch.float16,
+                ).to(DEVICE)
+                # Disable safety features
+                if hasattr(pipeline, 'safety_checker'):
+                    pipeline.safety_checker = None
+                
+            elif pipeline_type == "qwen":
+                from transformers import Qwen2VLForConditionalGeneration, AutoTokenizer, AutoProcessor
+                model = Qwen2VLForConditionalGeneration.from_pretrained(
+                    model_name,
+                    torch_dtype="auto",
+                    device_map="auto"
+                )
+                tokenizer = AutoTokenizer.from_pretrained(model_name)
+                processor = AutoProcessor.from_pretrained(model_name)
+                pipeline = {"model": model, "tokenizer": tokenizer, "processor": processor}
+                
+            elif pipeline_type == "video":
+                from diffusers import CogVideoXPipeline
+                pipeline = CogVideoXPipeline.from_pretrained(
+                    model_name,
+                    torch_dtype=torch.bfloat16
+                ).to(DEVICE)
+                # Disable safety for uncensored generation
+                if hasattr(pipeline, 'safety_checker'):
+                    pipeline.safety_checker = None
+                    
+            else:
+                raise ValueError(f"Unknown pipeline type: {pipeline_type}")
+            
+            # Cache the loaded pipeline
+            PIPELINE_CACHE.set(cache_key, pipeline)
+            logger.info(f"Successfully loaded and cached: {cache_key}")
+            return pipeline
+            
+    except Exception as e:
+        logger.error(f"Failed to load pipeline {cache_key}: {str(e)}")
+        logger.error(traceback.format_exc())
+        raise RuntimeError(f"Pipeline loading failed: {str(e)}")
+
+def generate_image_safe(
+    pipeline_type: str,
+    model_name: str,
+    prompt: str,
+    width: int = 1024,
+    height: int = 1024,
+    num_inference_steps: int = 20,
+    guidance_scale: float = 7.5,
+    num_images: int = 1,
+    seed: Optional[int] = None
+) -> List[Image.Image]:
+    """Safe image generation with proper error handling and validation"""
+    
+    # Validate inputs
+    width, height = validate_resolution(width, height)
+    num_images = max(1, min(4, num_images))  # Limit to prevent memory issues
+    num_inference_steps = max(1, min(100, num_inference_steps))
+    
+    if not prompt or not prompt.strip():
+        raise ValueError("Prompt cannot be empty")
+    
+    try:
+        pipeline = load_pipeline_safe(pipeline_type, model_name)
+        
+        # Set up generation parameters
+        generator = torch.Generator(device=DEVICE)
+        if seed is not None:
+            generator.manual_seed(seed)
+        
+        with cuda_memory_cleanup():
+            if pipeline_type == "flux":
+                images = pipeline(
+                    prompt=prompt,
+                    width=width,
+                    height=height,
+                    num_inference_steps=num_inference_steps,
+                    guidance_scale=guidance_scale,
+                    num_images_per_prompt=num_images,
+                    generator=generator,
+                    max_sequence_length=512
+                ).images
+                
+            elif pipeline_type == "wuerstchen":
+                images = pipeline(
+                    prompt=prompt,
+                    width=width,
+                    height=height,
+                    num_inference_steps=num_inference_steps,
+                    guidance_scale=guidance_scale,
+                    num_images_per_prompt=num_images,
+                    generator=generator
+                ).images
+                
+            else:
+                raise ValueError(f"Image generation not supported for: {pipeline_type}")
+        
+        logger.info(f"Successfully generated {len(images)} images")
+        return images
+        
+    except Exception as e:
+        logger.error(f"Image generation failed: {str(e)}")
+        logger.error(traceback.format_exc())
+        raise RuntimeError(f"Image generation failed: {str(e)}")
+
+def generate_video_safe(
+    model_name: str,
+    prompt: str,
+    width: int = 720,
+    height: int = 480,
+    num_frames: int = 49,
+    num_inference_steps: int = 50,
+    guidance_scale: float = 6.0,
+    seed: Optional[int] = None
+) -> str:
+    """Safe video generation with proper validation"""
+    
+    # Validate video resolution
+    if (width, height) not in VIDEO_RESOLUTION_PRESETS.values():
+        logger.warning(f"Invalid video resolution {width}x{height}, using 720x480")
+        width, height = 854, 480
+    
+    # Validate frame count (CogVideoX specific)
+    valid_frames = [49, 81]  # CogVideoX supported frame counts
+    if num_frames not in valid_frames:
+        num_frames = 49
+        logger.warning(f"Invalid frame count, using {num_frames}")
+    
+    if not prompt or not prompt.strip():
+        raise ValueError("Prompt cannot be empty")
+    
+    try:
+        pipeline = load_pipeline_safe("video", model_name)
+        
+        # Set up generation
+        generator = torch.Generator(device=DEVICE)
+        if seed is not None:
+            generator.manual_seed(seed)
+        
+        with cuda_memory_cleanup():
+            video_frames = pipeline(
+                prompt=prompt,
+                width=width,
+                height=height,
+                num_frames=num_frames,
+                num_inference_steps=num_inference_steps,
+                guidance_scale=guidance_scale,
+                generator=generator
+            ).frames[0]
+        
+        # Save video
+        output_path = f"/tmp/generated_video_{int(time.time())}.mp4"
+        
+        # Convert frames to video using imageio
+        import imageio
+        with imageio.get_writer(output_path, fps=8) as writer:
+            for frame in video_frames:
+                writer.append_data(np.array(frame))
+        
+        logger.info(f"Video saved to: {output_path}")
+        return output_path
+        
+    except Exception as e:
+        logger.error(f"Video generation failed: {str(e)}")
+        logger.error(traceback.format_exc())
+        raise RuntimeError(f"Video generation failed: {str(e)}")
+
+def analyze_image_safe(model_name: str, image: Image.Image, prompt: str) -> str:
+    """Safe image analysis with proper error handling"""
+    
+    if image is None:
+        raise ValueError("No image provided")
+    
+    if not prompt or not prompt.strip():
+        prompt = "Describe this image in detail."
+    
+    try:
+        pipeline_components = load_pipeline_safe("qwen", model_name)
+        model = pipeline_components["model"]
+        tokenizer = pipeline_components["tokenizer"]
+        processor = pipeline_components["processor"]
+        
+        # Prepare the conversation
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": image},
+                    {"type": "text", "text": prompt}
+                ]
+            }
+        ]
+        
+        # Process inputs
+        text = processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+        
+        image_inputs, video_inputs = processor.process(
+            text=[text], images=[image], videos=None, padding=True, return_tensors="pt"
+        )
+        
+        # Move to device
+        image_inputs = image_inputs.to(model.device)
+        
+        # Generate response
+        with torch.no_grad():
+            generated_ids = model.generate(
+                **image_inputs,
+                max_new_tokens=512,
+                do_sample=True,
+                temperature=0.7,
+                top_p=0.9
+            )
+        
+        # Decode response
+        generated_ids_trimmed = [
+            out_ids[len(in_ids):] for in_ids, out_ids in zip(image_inputs.input_ids, generated_ids)
+        ]
+        
+        response = processor.batch_decode(
+            generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
+        )[0]
+        
+        logger.info("Image analysis completed successfully")
+        return response
+        
+    except Exception as e:
+        logger.error(f"Image analysis failed: {str(e)}")
+        logger.error(traceback.format_exc())
+        raise RuntimeError(f"Image analysis failed: {str(e)}")
+
+# Gradio interface functions
+def gradio_generate_image(
+    pipeline_type: str,
+    model_name: str,
+    prompt: str,
+    resolution: str,
+    num_inference_steps: int,
+    guidance_scale: float,
+    num_images: int,
+    seed: Optional[int]
+) -> Tuple[List[Image.Image], str]:
+    """Gradio wrapper for image generation"""
+    
+    if not prompt.strip():
+        return [], "Error: Prompt cannot be empty"
+    
+    try:
+        # Parse resolution
+        if resolution in RESOLUTION_PRESETS:
+            width, height = RESOLUTION_PRESETS[resolution]
+        else:
+            width, height = 1024, 1024  # Default
+        
+        # Submit task to executor to prevent blocking
+        future = TASK_EXECUTOR.submit(
+            generate_image_safe,
+            pipeline_type, model_name, prompt, width, height,
+            num_inference_steps, guidance_scale, num_images, seed
+        )
+        
+        # Wait for completion with timeout
+        images = future.result(timeout=TASK_TIMEOUT)
+        
+        return images, f"Successfully generated {len(images)} images"
+        
+    except Exception as e:
+        error_msg = f"Generation failed: {str(e)}"
+        logger.error(error_msg)
+        return [], error_msg
+
+def gradio_generate_video(
+    model_name: str,
+    prompt: str,
+    resolution: str,
+    num_frames: int,
+    num_inference_steps: int,
+    guidance_scale: float,
+    seed: Optional[int]
+) -> Tuple[Optional[str], str]:
+    """Gradio wrapper for video generation"""
+    
+    if not prompt.strip():
+        return None, "Error: Prompt cannot be empty"
+    
+    try:
+        # Parse resolution
+        if resolution in VIDEO_RESOLUTION_PRESETS:
+            width, height = VIDEO_RESOLUTION_PRESETS[resolution]
+        else:
+            width, height = 854, 480  # Default
+        
+        # Submit task to executor
+        future = TASK_EXECUTOR.submit(
+            generate_video_safe,
+            model_name, prompt, width, height,
+            num_frames, num_inference_steps, guidance_scale, seed
+        )
+        
+        # Wait for completion with timeout
+        video_path = future.result(timeout=TASK_TIMEOUT * 2)  # Videos take longer
+        
+        return video_path, f"Video generated successfully"
+        
+    except Exception as e:
+        error_msg = f"Video generation failed: {str(e)}"
+        logger.error(error_msg)
+        return None, error_msg
+
+def gradio_analyze_image(
+    model_name: str,
+    image: Image.Image,
+    prompt: str
+) -> Tuple[str, str]:
+    """Gradio wrapper for image analysis"""
+    
+    if image is None:
+        return "", "Error: Please upload an image"
+    
+    try:
+        # Submit task to executor
+        future = TASK_EXECUTOR.submit(analyze_image_safe, model_name, image, prompt)
+        
+        # Wait for completion
+        analysis = future.result(timeout=TASK_TIMEOUT)
+        
+        return analysis, "Analysis completed successfully"
+        
+    except Exception as e:
+        error_msg = f"Analysis failed: {str(e)}"
+        logger.error(error_msg)
+        return "", error_msg
+
+def create_gradio_interface() -> gr.Blocks:
+    """Create the main Gradio interface"""
+    
+    with gr.Blocks(
+        title="RunPod AI Kit - Fixed Version",
+        theme=gr.themes.Soft(),
+        css="footer {visibility: hidden}"
+    ) as interface:
+        
+        gr.Markdown("# 🚀 RunPod AI Kit - Production Ready")
+        gr.Markdown("*Fixed version with proper async handling, thread safety, and error management*")
+        
+        with gr.Tabs():
+            # Image Generation Tab
+            with gr.Tab("🎨 Image Generation"):
+                with gr.Row():
+                    with gr.Column():
+                        img_pipeline = gr.Dropdown(
+                            choices=["flux", "wuerstchen"],
+                            value="flux",
+                            label="Pipeline Type"
+                        )
+                        img_model = gr.Textbox(
+                            value="black-forest-labs/FLUX.1-dev",
+                            label="Model Name"
+                        )
+                        img_prompt = gr.Textbox(
+                            label="Prompt",
+                            placeholder="A beautiful landscape...",
+                            lines=3
+                        )
+                        img_resolution = gr.Dropdown(
+                            choices=list(RESOLUTION_PRESETS.keys()),
+                            value="Square (1024x1024)",
+                            label="Resolution"
+                        )
+                        
+                        with gr.Row():
+                            img_steps = gr.Slider(1, 100, value=20, label="Steps")
+                            img_guidance = gr.Slider(1, 20, value=7.5, label="Guidance Scale")
+                        
+                        with gr.Row():
+                            img_count = gr.Slider(1, 4, value=1, step=1, label="Images")
+                            img_seed = gr.Number(label="Seed (optional)", precision=0)
+                        
+                        img_generate_btn = gr.Button("🎨 Generate Images", variant="primary")
+                    
+                    with gr.Column():
+                        img_gallery = gr.Gallery(
+                            label="Generated Images",
+                            show_label=True,
+                            elem_id="gallery",
+                            columns=2,
+                            rows=2,
+                            height="auto"
+                        )
+                        img_status = gr.Textbox(label="Status", interactive=False)
+                
+                img_generate_btn.click(
+                    fn=gradio_generate_image,
+                    inputs=[
+                        img_pipeline, img_model, img_prompt, img_resolution,
+                        img_steps, img_guidance, img_count, img_seed
+                    ],
+                    outputs=[img_gallery, img_status]
+                )
+            
+            # Video Generation Tab
+            with gr.Tab("🎬 Video Generation"):
+                with gr.Row():
+                    with gr.Column():
+                        vid_model = gr.Textbox(
+                            value="THUDM/CogVideoX-5b",
+                            label="Model Name"
+                        )
+                        vid_prompt = gr.Textbox(
+                            label="Prompt",
+                            placeholder="A person walking in the forest...",
+                            lines=3
+                        )
+                        vid_resolution = gr.Dropdown(
+                            choices=list(VIDEO_RESOLUTION_PRESETS.keys()),
+                            value="480p (854x480)",
+                            label="Resolution"
+                        )
+                        
+                        with gr.Row():
+                            vid_frames = gr.Dropdown(
+                                choices=[49, 81],
+                                value=49,
+                                label="Frames"
+                            )
+                            vid_steps = gr.Slider(10, 100, value=50, label="Steps")
+                        
+                        with gr.Row():
+                            vid_guidance = gr.Slider(1, 20, value=6.0, label="Guidance Scale")
+                            vid_seed = gr.Number(label="Seed (optional)", precision=0)
+                        
+                        vid_generate_btn = gr.Button("🎬 Generate Video", variant="primary")
+                    
+                    with gr.Column():
+                        vid_output = gr.Video(label="Generated Video")
+                        vid_status = gr.Textbox(label="Status", interactive=False)
+                
+                vid_generate_btn.click(
+                    fn=gradio_generate_video,
+                    inputs=[
+                        vid_model, vid_prompt, vid_resolution,
+                        vid_frames, vid_steps, vid_guidance, vid_seed
+                    ],
+                    outputs=[vid_output, vid_status]
+                )
+            
+            # Image Analysis Tab
+            with gr.Tab("🔍 Image Analysis"):
+                with gr.Row():
+                    with gr.Column():
+                        ana_model = gr.Textbox(
+                            value="Qwen/Qwen2-VL-7B-Instruct",
+                            label="Model Name"
+                        )
+                        ana_image = gr.Image(
+                            type="pil",
+                            label="Upload Image"
+                        )
+                        ana_prompt = gr.Textbox(
+                            value="Describe this image in detail.",
+                            label="Analysis Prompt",
+                            lines=2
+                        )
+                        ana_analyze_btn = gr.Button("🔍 Analyze Image", variant="primary")
+                    
+                    with gr.Column():
+                        ana_output = gr.Textbox(
+                            label="Analysis Result",
+                            lines=15,
+                            interactive=False
+                        )
+                        ana_status = gr.Textbox(label="Status", interactive=False)
+                
+                ana_analyze_btn.click(
+                    fn=gradio_analyze_image,
+                    inputs=[ana_model, ana_image, ana_prompt],
+                    outputs=[ana_output, ana_status]
+                )
+            
+            # System Info Tab
+            with gr.Tab("📊 System Info"):
+                with gr.Column():
+                    gr.Markdown("### System Information")
+                    
+                    system_info = f"""
+                    - **Device**: {DEVICE}
+                    - **CUDA Available**: {torch.cuda.is_available()}
+                    - **Cache Size**: {PIPELINE_CACHE._max_size}
+                    - **Task Timeout**: {TASK_TIMEOUT}s
+                    - **Safety Features**: Disabled (Testing Mode)
+                    """
+                    
+                    gr.Markdown(system_info)
+                    
+                    if torch.cuda.is_available():
+                        gpu_info = f"""
+                        ### GPU Information
+                        - **GPU Count**: {torch.cuda.device_count()}
+                        - **Current Device**: {torch.cuda.current_device()}
+                        - **Device Name**: {torch.cuda.get_device_name(0)}
+                        """
+                        gr.Markdown(gpu_info)
+                    
+                    clear_cache_btn = gr.Button("🗑️ Clear Cache", variant="secondary")
+                    cache_status = gr.Textbox(label="Cache Status", interactive=False)
+                    
+                    def clear_pipeline_cache():
+                        try:
+                            PIPELINE_CACHE.clear()
+                            return "Cache cleared successfully"
+                        except Exception as e:
+                            return f"Error clearing cache: {str(e)}"
+                    
+                    clear_cache_btn.click(
+                        fn=clear_pipeline_cache,
+                        outputs=[cache_status]
+                    )
+        
+        gr.Markdown("---")
+        gr.Markdown("*RunPod AI Kit v2.0 - Fixed Production Version*")
+    
+    return interface
+
+def main():
+    """Main application entry point"""
+    logger.info("Starting RunPod AI Kit - Fixed Version")
+    
+    try:
+        # Create and launch interface
+        interface = create_gradio_interface()
+        
+        # Launch with proper configuration
+        interface.launch(
+            server_name="0.0.0.0",
+            server_port=7860,
+            share=False,
+            debug=False,
+            enable_queue=True,
+            max_threads=10,
+            auth=None,
+            inbrowser=False
+        )
+        
+    except KeyboardInterrupt:
+        logger.info("Shutting down gracefully...")
+    except Exception as e:
+        logger.error(f"Application failed to start: {str(e)}")
+        logger.error(traceback.format_exc())
+        raise
+    finally:
+        # Cleanup resources
+        PIPELINE_CACHE.clear()
+        TASK_EXECUTOR.shutdown(wait=True)
+        logger.info("Cleanup completed")
 
 if __name__ == "__main__":
-    demo = build_interface()
-    # Launch with concurrency to support background tasks
-    demo.queue()  # enable queueing within Gradio itself
-    demo.launch(server_name="0.0.0.0", server_port=int(os.environ.get("PORT", 7860)))
+    main()
