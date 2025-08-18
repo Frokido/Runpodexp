@@ -10,7 +10,7 @@ RunPod L40S GPU (48 GB VRAM).
 Notes:
   * Actual model downloads can take a long time and may require large
     amounts of disk space. Ensure your pod has sufficient storage.
-  * This script does **not** enable any safety checker — NSFW content will
+  * This script does **not** enable any safety checker â€” NSFW content will
     pass through untouched. Use responsibly.
 
 Author: ChatGPT (generated)
